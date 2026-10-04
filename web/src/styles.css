@@ -1207,16 +1207,44 @@ input[type="range"]:disabled {
   cursor: pointer;
   touch-action: none;
 }
+/* 原曲 / 採譜 MIDI / カバー の 3 つを縦に並べる (横 1 本だと狭いところで入らない) */
 .player-mix {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: flex-end;
+}
+.player-tracks {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  min-width: 0;
   font-size: 12px;
   color: var(--text-2);
 }
-.player-mix input {
+.player-track {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.player-track > span {
+  width: 60px;
+  flex-shrink: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.player-track input {
   flex: 1;
-  --fill: 50%;
+}
+/* まだ読み込めていない音 (原曲なし・カバー未選択など) は灰色にする */
+.player-track.off {
+  opacity: 0.45;
+}
+/* 携帯用: 3 本をそのまま出すと場所を取りすぎるので、アイコンを押して開くパネルに入れる */
+.mix-btn,
+.mixer-pop {
+  display: none;
 }
 
 /* ------------------------------------------------------------ 狭い画面 */
@@ -1583,8 +1611,36 @@ input[type="range"]:disabled {
   }
   .player-mix {
     grid-area: mix;
+    justify-content: flex-end;
+  }
+  .player-tracks {
+    display: none;
+  }
+  .mix-btn {
+    display: inline-flex;
+  }
+  .player-mix.open .mixer-pop {
+    display: grid;
     gap: 6px;
+    position: absolute;
+    bottom: calc(100% + 10px);
+    right: 0;
+    z-index: 30;
+    min-width: 232px;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--panel);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+    font-size: 12px;
+    color: var(--text-2);
+  }
+  .mixer-title {
     font-size: 11px;
+    color: var(--text-3);
+  }
+  .player-track > span {
+    width: 62px;
   }
   .player-mix input {
     min-width: 36px;
@@ -1598,13 +1654,6 @@ input[type="range"]:disabled {
   }
   .library {
     padding: 16px 12px 40px;
-  }
-}
-
-/* 幅が足りないときは「原曲 / カバー」の文字を省いてつまみを広く使う */
-@media (max-width: 400px) {
-  .player-mix > span {
-    display: none;
   }
 }
 

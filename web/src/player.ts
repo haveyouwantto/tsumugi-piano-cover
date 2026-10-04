@@ -1,13 +1,75 @@
-// 原曲の音源とカバー (ピアノの音源で鳴らす) を同じ時計で再生する。
-// カバーは原曲の時間軸の上に生成しているので、同じ秒で並べればそのまま重なる。
+// 原曲の音源・tsumugi の採譜 MIDI・生成したカバーを同じ時計で再生する。
+// カバーはピアノの音源 (smplr のサンプル) で、採譜 MIDI は PicoAudio (@maple-kaede/picoaudio) で鳴らす。
+// どちらも原曲の時間軸の上で作っているので、同じ秒で並べればそのまま重なる。
 // テイクを切り替えても再生位置はそのままなので、同じ所を聴き比べられる。
+import PicoAudio from "@maple-kaede/picoaudio";
 import { CacheStorage, Scheduler, SplendidGrandPiano, audioBufferToWav16, renderOffline, type Smplr } from "smplr";
 import type { CoverNote } from "./api";
 
 const LOOKAHEAD = 0.3; // 何秒先までの音を予約するか
 const TICK_MS = 25;
 
+/** 画面に並べる 3 つの音: 原曲の音源 / tsumugi の採譜 MIDI / 生成したカバー */
+export type TrackName = "original" | "transcribed" | "cover";
+export const TRACKS: TrackName[] = ["original", "transcribed", "cover"];
+export const DEFAULT_VOLUME: Record<TrackName, number> = { original: 0.85, transcribed: 0.7, cover: 0.75 };
+
+/** つまみの位置 (0〜1) を実際の音量に直す。耳は音量を対数的に感じるので、そのまま (線形) 使うと
+    下の方を動かしてもほとんど変わらない。二乗するとつまみの動きと聴こえ方がだいたい比例する */
+const gainOf = (volume: number) => volume * volume;
+
 export type PianoState = "loading" | "ready" | "fallback";
+
+/** MIDI 1 本を PicoAudio で鳴らす。位置は呼ぶ側の時計で持つので、曲を差し替えても同じ所から鳴らせる */
+class MidiTrack {
+  private pico: PicoAudio | null = null;
+  private bytes: Uint8Array | null = null;
+  volume: number;
+
+  constructor(
+    private readonly ctx: AudioContext,
+    volume: number,
+  ) {
+    this.volume = volume;
+  }
+
+  get ready(): boolean {
+    return this.bytes !== null;
+  }
+
+  set(bytes: Uint8Array | null) {
+    this.bytes = bytes;
+  }
+
+  setVolume(volume: number) {
+    this.volume = volume;
+    this.pico?.setMasterVolume(volume);
+  }
+
+  play(from: number) {
+    if (!this.bytes) return;
+    const pico = this.ensure();
+    pico.setData(pico.parseSMF(this.bytes));
+    pico.initStatus();
+    pico.setStartTime(Math.max(0, from));
+    pico.play();
+  }
+
+  pause() {
+    if (!this.pico) return;
+    this.pico.pause();
+    this.pico.initStatus();
+  }
+
+  private ensure(): PicoAudio {
+    if (!this.pico) {
+      this.pico = new PicoAudio({ debug: false, audioContext: this.ctx });
+      this.pico.init();
+      this.pico.setMasterVolume(this.volume);
+    }
+    return this.pico;
+  }
+}
 
 export class Player {
   readonly ctx: AudioContext;
@@ -16,6 +78,7 @@ export class Player {
   private piano: Smplr | null = null;
   pianoState: PianoState = "loading";
   pianoProgress = 0;
+  private transcribed: MidiTrack;
 
   original: AudioBuffer | null = null;
   originalUrl: string | null = null;
@@ -35,7 +98,8 @@ export class Player {
 
   loop: [number, number] | null = null;
   loopOn = false;
-  mix = 0.5; // 0 = 原曲だけ、1 = カバーだけ
+  volumes: Record<TrackName, number> = { ...DEFAULT_VOLUME };
+  private transcribedUrl: string | null = null;
   private extraDuration = 0;
 
   private listeners = new Set<() => void>();
@@ -47,7 +111,9 @@ export class Player {
     this.coverGain = this.ctx.createGain();
     this.originalGain.connect(this.ctx.destination);
     this.coverGain.connect(this.ctx.destination);
-    this.setMix(this.mix);
+    this.originalGain.gain.value = gainOf(this.volumes.original);
+    this.coverGain.gain.value = gainOf(this.volumes.cover);
+    this.transcribed = new MidiTrack(this.ctx, gainOf(this.volumes.transcribed));
     this.loadPiano();
   }
 
@@ -80,6 +146,13 @@ export class Player {
     this.piano = null;
     this.pianoState = "fallback";
     this.emit();
+  }
+
+  /** その音が鳴らせるか (つまみを灰色にするのに使う) */
+  has(track: TrackName): boolean {
+    if (track === "original") return this.original !== null;
+    if (track === "cover") return this.notes.length > 0;
+    return this.transcribed.ready;
   }
 
   // ------------------------------------------------------------ 購読
@@ -116,6 +189,27 @@ export class Player {
       this.emit();
     }
     if (wasPlaying && this.originalUrl === url) this.play(pos);
+  }
+
+  /** tsumugi の採譜 MIDI (原曲の時間軸、複数の楽器が入っている) */
+  async setTranscribedMidi(url: string | null) {
+    if (url === this.transcribedUrl) return;
+    const wasPlaying = this.playing;
+    this.transcribedUrl = url;
+    this.transcribed.set(null);
+    this.emit();
+    if (!url) return;
+    try {
+      const res = await fetch(url);
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      if (this.transcribedUrl !== url) return; // 途中で別の曲に変わった
+      this.transcribed.set(bytes);
+      this.transcribed.setVolume(gainOf(this.volumes.transcribed));
+      if (this.playing || wasPlaying) this.transcribed.play(this.position() + 0.05);
+    } catch (e) {
+      console.warn("採譜 MIDI を読めませんでした", e);
+    }
+    this.emit();
   }
 
   setNotes(notes: CoverNote[]) {
@@ -182,11 +276,16 @@ export class Player {
     this.emit();
   }
 
-  setMix(mix: number) {
-    this.mix = mix;
-    const t = this.ctx.currentTime;
-    this.originalGain.gain.setTargetAtTime(Math.min(1, 2 * (1 - mix)), t, 0.02);
-    this.coverGain.gain.setTargetAtTime(Math.min(1, 2 * mix), t, 0.02);
+  setVolume(track: TrackName, volume: number) {
+    this.volumes[track] = volume;
+    const gain = gainOf(volume);
+    if (track === "original") {
+      this.originalGain.gain.setTargetAtTime(gain, this.ctx.currentTime, 0.02);
+    } else if (track === "cover") {
+      this.coverGain.gain.setTargetAtTime(gain, this.ctx.currentTime, 0.02);
+    } else {
+      this.transcribed.setVolume(gain);
+    }
     this.emit();
   }
 
@@ -214,6 +313,8 @@ export class Player {
       source.start(this.anchorCtx, pos);
       this.originalSource = source;
     }
+    // 採譜 MIDI は PicoAudio がすぐ鳴り始めるので、こちらの時計に合わせて少し先から始める
+    this.transcribed.play(pos + 0.05);
     this.nextIndex = lowerBound(this.notes, pos);
     this.timer = window.setInterval(this.tick, TICK_MS);
     this.tick();
@@ -232,6 +333,7 @@ export class Player {
       this.originalSource = null;
     }
     this.piano?.stop();
+    this.transcribed.pause();
     for (const osc of this.fallbackVoices) {
       try {
         osc.stop();

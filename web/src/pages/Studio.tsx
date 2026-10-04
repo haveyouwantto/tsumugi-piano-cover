@@ -104,6 +104,11 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
     void player.setOriginal(data?.audio ? urls.audio(pid) : null);
   }, [pid, data?.audio, player]);
 
+  // 採譜 MIDI (tsumugi の出力)。原曲の時間軸なので、原曲やカバーと同じ秒で鳴る
+  useEffect(() => {
+    void player.setTranscribedMidi(data?.source ? urls.sourceMidi(pid) : null);
+  }, [pid, data?.source?.created, player]);
+
   useEffect(() => {
     player.setExtraDuration(sourceView.data?.duration ?? 0);
   }, [sourceView.data, player]);
@@ -116,6 +121,7 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
       player.setLoop(null);
       player.seek(0);
       void player.setOriginal(null);
+      void player.setTranscribedMidi(null);
     },
     [pid, player],
   );

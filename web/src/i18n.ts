@@ -197,15 +197,18 @@ const ja = {
   memo: "メモ",
   memoPlaceholder: "気づいたこと (サビの合いの手が良い、など)",
   // 再生バー
-  pianoLoading: (p: number) => `ピアノ音源を読み込み中 ${p}%`,
-  pianoFallback: "ピアノ音源を読めないので簡易音で再生",
   back5: "5 秒戻る (←)",
   forward5: "5 秒進む (→)",
   playPause: "再生 / 停止 (Space)",
+  pianoLoading: (p: number) => `ピアノ音源を読み込み中 ${p}%`,
+  pianoFallback: "ピアノ音源を読めないので簡易音で再生",
   loopHelp: "ループ (L)。ピアノロールをドラッグして区間を選ぶ",
   cover: "カバー",
-  mixHelp: "原曲とカバーの配分 (ダブルクリックで半々)",
-  mixLabel: "原曲とカバーの音量の配分",
+  transcribed: "採譜 MIDI",
+  mixer: "音量",
+  mixerHelp: "音量 (原曲・採譜 MIDI・カバー)",
+  trackVolume: (name: string) => `${name}の音量 (ダブルクリックで既定に戻す)`,
+  trackVolumeHelp: "原曲・採譜 MIDI・カバーを別々の音量で重ねて聴き比べる",
 };
 
 type Dict = typeof ja;
@@ -405,15 +408,18 @@ const en: Dict = {
   defaultValue: (v) => `(default ${v})`,
   memo: "Notes",
   memoPlaceholder: "What you noticed (e.g. nice fills in the chorus)",
-  pianoLoading: (p) => `Loading piano samples ${p}%`,
-  pianoFallback: "Piano samples unavailable; using a simple synth",
   back5: "Back 5 s (←)",
   forward5: "Forward 5 s (→)",
   playPause: "Play / pause (Space)",
+  pianoLoading: (p: number) => `Loading piano samples ${p}%`,
+  pianoFallback: "Piano samples unavailable; using a simple synth",
   loopHelp: "Loop (L). Drag on the piano roll to select a range",
   cover: "Cover",
-  mixHelp: "Balance between original and cover (double-click to center)",
-  mixLabel: "Volume balance between the original and the cover",
+  transcribed: "Transcribed MIDI",
+  mixer: "Volumes",
+  mixerHelp: "Volumes (original, transcription, cover)",
+  trackVolume: (name: string) => `${name} volume (double-click to reset)`,
+  trackVolumeHelp: "Mix the original, the transcription and the cover with separate volumes",
 };
 
 const DICTS: Record<Lang, Dict> = { ja, en };

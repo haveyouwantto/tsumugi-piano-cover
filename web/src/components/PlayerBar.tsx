@@ -1,8 +1,10 @@
-// 画面の下に固定する再生バー。シークバーには原曲の波形とカバーの音の多さを重ねて描く
-import { useEffect, useMemo, useRef, useSyncExternalStore } from "react";
+// 画面の下に固定する再生バー。シークバーには原曲の波形とカバーの音の多さを重ねて描く。
+// 原曲 / 採譜 MIDI / カバー の 3 つを別々の音量で重ねて聴き比べられる。
+// 携帯では 3 本を並べると場所を取りすぎるので、アイコンを押して開くパネルに入れる
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
 import { useT } from "../i18n";
 import { formatTime } from "../params";
-import type { Player } from "../player";
+import { DEFAULT_VOLUME, TRACKS, type Player, type TrackName } from "../player";
 import { Icon } from "./Icon";
 
 type Props = { player: Player; title: string; subtitle: string };
@@ -16,6 +18,25 @@ export function PlayerBar({ player, title, subtitle }: Props) {
   usePlayerState(player);
   const t = useT();
   const timeRef = useRef<HTMLSpanElement>(null);
+  const [mixOpen, setMixOpen] = useState(false);
+  const mixRef = useRef<HTMLDivElement>(null);
+
+  // 開いている間は、外を押すか Esc で閉じる
+  useEffect(() => {
+    if (!mixOpen) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (!mixRef.current?.contains(e.target as Node)) setMixOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMixOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [mixOpen]);
 
   useEffect(() => {
     let raf = 0;
@@ -27,6 +48,11 @@ export function PlayerBar({ player, title, subtitle }: Props) {
     return () => cancelAnimationFrame(raf);
   }, [player]);
 
+  const trackLabel: Record<TrackName, string> = {
+    original: t.original,
+    transcribed: t.transcribed,
+    cover: t.cover,
+  };
   const pianoNote =
     player.pianoState === "loading"
       ? t.pianoLoading(Math.round(player.pianoProgress * 100))
@@ -68,22 +94,55 @@ export function PlayerBar({ player, title, subtitle }: Props) {
           <span className="mono">{formatTime(player.duration)}</span>
         </div>
       </div>
-      <div className="player-mix">
-        <span className={player.original ? "" : "muted"}>{t.original}</span>
-        <input
-          type="range"
-          min={0}
-          max={1}
-          step={0.01}
-          value={player.mix}
-          onChange={(e) => player.setMix(Number(e.target.value))}
-          onDoubleClick={() => player.setMix(0.5)}
-          aria-label={t.mixLabel}
-          title={t.mixHelp}
-        />
-        <span>{t.cover}</span>
+      <div className={`player-mix ${mixOpen ? "open" : ""}`} ref={mixRef}>
+        <div className="player-tracks">
+          <TrackVolumes player={player} label={trackLabel} />
+        </div>
+        {/* 携帯だけに出る。押すと上のパネルが開く */}
+        <button
+          className={`icon-btn mix-btn ${mixOpen ? "on" : ""}`}
+          onClick={() => setMixOpen(!mixOpen)}
+          aria-expanded={mixOpen}
+          aria-label={t.mixerHelp}
+          title={t.mixerHelp}
+        >
+          <Icon name="mixer" />
+        </button>
+        <div className="mixer-pop" role="dialog" aria-label={t.mixerHelp}>
+          <div className="mixer-title">{t.mixer}</div>
+          <TrackVolumes player={player} label={trackLabel} />
+        </div>
       </div>
     </footer>
+  );
+}
+
+/** 3 つの音量つまみ。広い画面では再生バーに、携帯ではアイコンで開くパネルに入る */
+function TrackVolumes({ player, label }: { player: Player; label: Record<TrackName, string> }) {
+  const t = useT();
+  return (
+    <>
+      {TRACKS.map((track) => {
+        const volume = player.volumes[track];
+        return (
+          <label key={track} className={`player-track ${player.has(track) ? "" : "off"}`}>
+            <span>{label[track]}</span>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={volume}
+              style={{ "--fill": `${Math.round(volume * 100)}%` } as CSSProperties}
+              onChange={(e) => player.setVolume(track, Number(e.target.value))}
+              onDoubleClick={() => player.setVolume(track, DEFAULT_VOLUME[track])}
+              aria-label={t.trackVolume(label[track])}
+              title={t.trackVolumeHelp}
+            />
+          </label>
+        );
+      })}
+    </>
   );
 }
 
