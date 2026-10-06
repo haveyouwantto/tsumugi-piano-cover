@@ -20,6 +20,8 @@ const PATHS: Record<string, string> = {
   chip: "M7 7h10v10H7zM9.5 3v4M14.5 3v4M9.5 17v4M14.5 17v4M3 9.5h4M3 14.5h4M17 9.5h4M17 14.5h4",
   // 3 本のフェーダー (音量)
   mixer: "M6 3.5v17M12 3.5v17M18 3.5v17M3.5 9h5M9.5 15.5h5M15.5 7h5",
+  // 右向きの三角 (詳細を開く / たたむハンドル。CSS で回して使う)
+  caret: "M9.5 5.5 16 12l-6.5 6.5z",
 };
 
 export function Icon({ name, size = 18, filled }: { name: string; size?: number; filled?: boolean }) {
