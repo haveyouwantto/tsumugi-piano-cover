@@ -346,8 +346,11 @@ class Engine:
         stopped.set()
         if should_stop():
             raise Cancelled()
-        if code != 0 or not out.is_file():
+        if not out.is_file():
             raise RuntimeError(f"tsumugi が失敗しました (終了コード {code})。ログを確かめてください")
+        if code != 0:
+            # ネイティブ側の後始末で落ちることがある (0xC0000409 など)。出力はできているので中身を優先する
+            log(f"tsumugi は終了コード {code} で終わりましたが、MIDI はできています")
         project.set_source(out, "tsumugi")
         out.unlink()
 
