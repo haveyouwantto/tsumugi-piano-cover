@@ -9,6 +9,8 @@ Global の入力は生成済みパッチの中身そのものなので、Local �
 
 from __future__ import annotations
 
+import functools
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
@@ -37,6 +39,16 @@ class Condition(Protocol):
         ...
 
     def local_output(self, index: Tensor, prefix: Tensor) -> OutputHook | None: ...
+
+    def local_cross_packed(self, index: Tensor, patches: Tensor) -> CrossHook:
+        """パッキング (num_length_buckets=0) 用。patches [N, L] は損失を取るパッチのトークン (後ろが PAD)。
+        フックの x は、各パッチの Local の入力 (BOS + 最後を除くトークン) をパディングせずにつなげた [1, T, D]
+        (PianoARModel._local_packed と同じ並び)"""
+        ...
+
+    def local_output_packed(self, index: Tensor, patches: Tensor) -> OutputHook | None:
+        """パッキング用の local_output。h [T, D]、logits [T, V] は local_cross_packed と同じ並び"""
+        ...
 
 
 class StepCondition(Protocol):
@@ -100,6 +112,17 @@ def _apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
 
 
+@functools.cache
+def flash_varlen_available() -> bool:
+    """パッキングで attention に dropout をかけるのに使う、flash attention の可変長版があるか。
+    Linux 版の torch と Ampere 以降の GPU にはある。Windows 版の torch (2.13) にはない"""
+    return (
+        torch.cuda.is_available()
+        and torch.backends.cuda.is_flash_attention_available()
+        and torch.cuda.get_device_capability() >= (8, 0)
+    )
+
+
 def prepare_block_compile(recompile_limit: int = 64) -> None:
     """ブロック単位の torch.compile の前に、作り直しの上限を上げて、使うグラフの順番を固定する。
 
@@ -133,7 +156,17 @@ class Block(nn.Module):
         self.down = nn.Linear(hidden, dim, bias=False)
         self.residual_dropout = nn.Dropout(dropout)
 
-    def forward(self, x: Tensor, rope: tuple[Tensor, Tensor], causal: bool, key_valid: Tensor | None) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        rope: tuple[Tensor, Tensor],
+        causal: bool,
+        key_valid: Tensor | None,
+        cu_seqlens: Tensor | None = None,
+        max_length: int = 0,
+    ) -> Tensor:
+        """cu_seqlens [N+1] (int32) を渡すと、x [1, T, D] は長さの違う N 本の系列をパディングせずにつなげたもの
+        (系列 i は cu_seqlens[i]:cu_seqlens[i+1]) として扱い、attention は各系列の中だけで取る。max_length は最長の系列の長さ"""
         batch, length, dim = x.shape
         q, k, v = (
             self.qkv(self.attn_norm(x)).view(batch, length, 3, self.heads, dim // self.heads).permute(2, 0, 3, 1, 4)
@@ -141,12 +174,38 @@ class Block(nn.Module):
         # rms_norm は autocast 下で fp32 を返すので、SDPA に渡す前に v と同じ精度に戻す
         q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
         q, k = _apply_rope(q, *rope), _apply_rope(k, *rope)
-        # 因果マスクとパディングマスクを同時に使う場面はない (因果側は右詰めのパディングで結果に影響しない)
-        mask = key_valid[:, None, None, :] if key_valid is not None else None
-        attn = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, is_causal=causal, dropout_p=self.dropout if self.training else 0.0
-        )
-        x = x + self.residual_dropout(self.attn_out(attn.transpose(1, 2).reshape(batch, length, dim)))
+        dropout = self.dropout if self.training else 0.0
+        if cu_seqlens is not None:
+            # SDPA の中身の attention を、系列の区切り (cu_seqlens) つきで直接呼ぶ。nested tensor 経由の SDPA は
+            # compile の backward で失敗する (torch 2.13)。連続でない入力を渡すと、compile したときの backward の勾配の並びが
+            # 合わずに失敗するので contiguous にする。
+            # dropout をかけるときは flash attention の可変長版を使う。memory-efficient attention の可変長版は、dropout の
+            # マスクが全ヘッド・全系列で同じになり (torch 2.13 で確認)、学習時の損失が 1.79 -> 2.08 に上がった
+            q, k, v = (t.transpose(1, 2).contiguous() for t in (q, k, v))  # [B, T, H, head_dim]
+            if dropout > 0:
+                attn = torch.ops.aten._flash_attention_forward(
+                    q[0], k[0], v[0], cu_seqlens, cu_seqlens, max_length, max_length, dropout, causal, False
+                )[0]
+            else:
+                attn = torch.ops.aten._efficient_attention_forward(
+                    q,
+                    k,
+                    v,
+                    None,
+                    cu_seqlens,
+                    cu_seqlens,
+                    max_length,
+                    max_length,
+                    0.0,
+                    1 if causal else 0,  # 1: 系列ごとの因果マスク (左上揃え)
+                    compute_log_sumexp=torch.is_grad_enabled() and q.requires_grad,
+                )[0]
+            x = x + self.residual_dropout(self.attn_out(attn.reshape(batch, length, dim)))
+        else:
+            # 因果マスクとパディングマスクを同時に使う場面はない (因果側は右詰めのパディングで結果に影響しない)
+            mask = key_valid[:, None, None, :] if key_valid is not None else None
+            attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=causal, dropout_p=dropout)
+            x = x + self.residual_dropout(self.attn_out(attn.transpose(1, 2).reshape(batch, length, dim)))
         gate, up = self.gate_up(self.mlp_norm(x)).chunk(2, dim=-1)
         return x + self.residual_dropout(self.down(F.silu(gate) * up))
 
@@ -189,18 +248,21 @@ class Transformer(nn.Module):
         key_valid: Tensor | None = None,
         positions: Tensor | None = None,
         cross: CrossHook | None = None,
+        cu_seqlens: Tensor | None = None,
+        max_length: int = 0,
     ) -> Tensor:
         """positions を省略すると 0, 1, 2, ... の位置で RoPE をかける。
         cross を渡すと i 番目のブロックの後に x = cross(i, x) を挟む (カバーモデルの cross-attention 用)。
+        cu_seqlens と max_length は、可変長の系列をつなげた入力のとき (Block.forward)。
         """
         if positions is None:
             positions = torch.arange(x.shape[1], device=x.device)
         rope = _rope(positions, self.head_dim)
         for i, block in enumerate(self.blocks):
             if self.gradient_checkpointing and self.training:
-                x = checkpoint(block, x, rope, self.causal, key_valid, use_reentrant=False)
+                x = checkpoint(block, x, rope, self.causal, key_valid, cu_seqlens, max_length, use_reentrant=False)
             else:
-                x = block(x, rope, self.causal, key_valid)
+                x = block(x, rope, self.causal, key_valid, cu_seqlens, max_length)
             if cross is not None:
                 x = cross(i, x)
         return self.norm(x)
@@ -247,8 +309,23 @@ class CrossBlock(nn.Module):
         self.mlp_gate = nn.Parameter(torch.zeros(1))
         self.residual_dropout = nn.Dropout(dropout)
 
-    def forward(self, x: Tensor, q_pos: Tensor, memory: Tensor, k_pos: Tensor, mask: Tensor) -> Tensor:
-        """x [B, Lq, D], q_pos [B, Lq], memory [B, M, memory_dim], k_pos [B, M], mask [B, Lq or 1, M] (True で見る)"""
+    def forward(
+        self,
+        x: Tensor,
+        q_pos: Tensor,
+        memory: Tensor,
+        k_pos: Tensor,
+        mask: Tensor | None,
+        cu_seqlens_q: Tensor | None = None,
+        cu_seqlens_k: Tensor | None = None,
+        key_index: Tensor | None = None,
+        max_q: int = 0,
+        max_k: int = 0,
+    ) -> Tensor:
+        """x [B, Lq, D], q_pos [B, Lq], memory [B, M, memory_dim], k_pos [B, M], mask [B, Lq or 1, M] (True で見る)。
+        cu_seqlens_q を渡すとパッキング版 (attend_packed、mask は使わない)"""
+        if cu_seqlens_q is not None:
+            return self.attend_packed(x, q_pos, memory, k_pos, cu_seqlens_q, cu_seqlens_k, key_index, max_q, max_k)
         return self.attend(x, q_pos, *self.memory_kv(memory, k_pos), mask)
 
     def memory_kv(self, memory: Tensor, k_pos: Tensor) -> tuple[Tensor, Tensor]:
@@ -270,8 +347,67 @@ class CrossBlock(nn.Module):
         q = _apply_rope(self.q_norm(q).to(v.dtype), *_rope(q_pos, head_dim))
         mask = F.pad(mask, (1, 0), value=True)[:, None]
         attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0.0)
-        attn = self.out(attn.transpose(1, 2).reshape(batch, length, self.inner_dim))
-        x = x + torch.tanh(self.attn_gate).to(x.dtype) * self.residual_dropout(attn)
+        return self._add(x, attn.transpose(1, 2).reshape(batch, length, self.inner_dim))
+
+    def attend_packed(
+        self,
+        x: Tensor,
+        q_pos: Tensor,
+        memory: Tensor,
+        k_pos: Tensor,
+        cu_seqlens_q: Tensor,
+        cu_seqlens_k: Tensor,
+        key_index: Tensor,
+        max_q: int,
+        max_k: int,
+    ) -> Tensor:
+        """パッキング版。x [1, T, D] / q_pos [T] は N 本のクエリの系列をつなげたもの (系列 i は cu_seqlens_q[i]:[i+1])。
+        memory [R, memory_dim] / k_pos [R] は各系列が見る行をつなげたもの。系列 i のキーは「空のキー + その行」で、
+        つなげたキーの各位置が memory の何番目か (空のキーは -1) を key_index [R + N]、区切りを cu_seqlens_k で渡す。
+
+        dropout をかけるときは flash attention の可変長版を使う (Block.forward と同じ理由)。クエリとキーの区切りが違っても、
+        p=0.1 で落とす割合と、ヘッドどうし・系列どうしの独立は正しい (torch 2.13、A100 で確認)。
+        flash は落とす確率を 8 bit に丸める (p=1e-6 でも約 1/255 を落とす) ので、塊で通したときと比べる確認に、ごく小さい
+        dropout で flash の経路を通す方法は使えない"""
+        length = x.shape[1]
+        head_dim = self.inner_dim // self.heads
+        k, v = self.kv(self.memory_norm(memory)).view(-1, 2, self.heads, head_dim).unbind(1)  # [R, H, head_dim]
+        k = _apply_rope(self.k_norm(k).to(v.dtype).transpose(0, 1), *_rope(k_pos, head_dim)).transpose(0, 1)
+        # 空のキーは位置によらないよう回転をかけない
+        is_null = (key_index < 0)[:, None, None]
+        safe = key_index.clamp(min=0)
+        # 全系列で原曲の行が 0 件になる場合もある。where は未採用の枝も評価するので、
+        # 空の k/v を safe=0 で索引できるよう番兵を 1 行足す。
+        k = F.pad(k, (0, 0, 0, 0, 0, 1))
+        v = F.pad(v, (0, 0, 0, 0, 0, 1))
+        k = torch.where(is_null, self.k_norm(self.null_k).to(v.dtype), k[safe]).contiguous()
+        v = torch.where(is_null, self.null_v.to(v.dtype), v[safe]).contiguous()
+        q = self.q(self.norm(x)).view(1, length, self.heads, head_dim).transpose(1, 2)
+        q = _apply_rope(self.q_norm(q).to(v.dtype), *_rope(q_pos, head_dim))[0].transpose(0, 1).contiguous()
+        dropout = self.dropout if self.training else 0.0
+        if dropout > 0:
+            attn = torch.ops.aten._flash_attention_forward(
+                q, k, v, cu_seqlens_q, cu_seqlens_k, max_q, max_k, dropout, False, False
+            )[0]
+        else:
+            attn = torch.ops.aten._efficient_attention_forward(
+                q[None],
+                k[None],
+                v[None],
+                None,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_q,
+                max_k,
+                0.0,
+                0,
+                compute_log_sumexp=torch.is_grad_enabled() and q.requires_grad,
+            )[0][0]
+        return self._add(x, attn.reshape(1, length, self.inner_dim))
+
+    def _add(self, x: Tensor, attn: Tensor) -> Tensor:
+        """attention の出力 [B, Lq, inner_dim] をゲートをかけて足し、MLP を通す"""
+        x = x + torch.tanh(self.attn_gate).to(x.dtype) * self.residual_dropout(self.out(attn))
         gate, up = self.gate_up(self.mlp_norm(x)).chunk(2, dim=-1)
         return x + torch.tanh(self.mlp_gate).to(x.dtype) * self.residual_dropout(self.down(F.silu(gate) * up))
 
@@ -301,6 +437,10 @@ class PianoARModel(nn.Module):
         # パッチごとの強さと音の多さなど (0 は指定なし)。列 c の番号 + c * (bins + 1) を同じ表で引く
         if config.dynamics_bins:
             self.dynamics_embedding = nn.Embedding(config.dynamics_columns * (config.dynamics_bins + 1), dim)
+        # 拍のトークンのモデル: 小節の拍数とテンポ (生成では原曲の拍から分かるので、予測せずに条件として渡す)
+        if config.max_bar_beats:
+            self.bar_embedding = nn.Embedding(config.max_bar_beats + 1, dim)
+            self.tempo_embedding = nn.Embedding(config.tempo_bins + 1, dim)
         self.global_transformer = Transformer(config, config.global_layers, causal=True)
 
         self.local_bos = nn.Parameter(torch.randn(dim) * 0.02)
@@ -341,14 +481,19 @@ class PianoARModel(nn.Module):
         channel: Tensor,
         cross: CrossHook | None = None,
         dynamics: Tensor | None = None,
+        bar_beats: Tensor | None = None,
+        tempo: Tensor | None = None,
     ) -> Tensor:
         """summaries[:, p] はパッチ p の要約。位置 p にはパッチ p-1 の要約を入れて h を返す。
-        dynamics [B, P, C] はパッチ p の強さと音の多さ (カバーでは編曲の性質も) の番号 (0 は指定なし)"""
+        dynamics [B, P, C] はパッチ p の強さと音の多さ (カバーでは編曲の性質も) の番号 (0 は指定なし)。
+        bar_beats / tempo [B, P] は拍のトークンのモデルでのパッチ p (小節) の拍数とテンポの段階"""
         inputs = torch.cat((self.bos(song_start)[:, None], summaries[:, :-1]), dim=1)
         inputs = inputs + self.pedal_embedding(pedal_state) + self.channel_embedding(channel)[:, None]
         if dynamics is not None and self.config.dynamics_bins:
             offset = torch.arange(dynamics.shape[-1], device=dynamics.device) * (self.config.dynamics_bins + 1)
             inputs = inputs + self.dynamics_embedding(dynamics + offset).sum(-2)
+        if self.config.max_bar_beats and bar_beats is not None:
+            inputs = inputs + self.bar_embedding(bar_beats) + self.tempo_embedding(tempo)
         return self.global_transformer(inputs, cross=cross)
 
     def local_forward(
@@ -360,6 +505,44 @@ class PianoARModel(nn.Module):
         h = self.local_transformer(x, cross=cross)
         logits = self.head(h)
         return output(h, logits) if output is not None else logits
+
+    def _summarize_packed(self, patches: Tensor) -> Tensor:
+        """summarize_patches と同じ要約を、パッチをパディングせずに 1 本につなげて計算する (num_length_buckets=0)"""
+        lengths = (patches != PAD).sum(-1) + 1  # 先頭の summary_token の分
+        cu_seqlens = F.pad(lengths.cumsum(0), (1, 0)).int()
+        starts = cu_seqlens[:-1].long()
+        total, max_length = int(cu_seqlens[-1]), int(lengths.max())
+        is_start = torch.zeros(total, dtype=torch.bool, device=patches.device)
+        is_start[starts] = True
+        ids = torch.zeros(total, dtype=patches.dtype, device=patches.device)
+        ids[~is_start] = patches[patches != PAD]  # パッチのトークンは左詰めで、PAD は後ろにだけある
+        summary_token = self.summary_token.to(self.token_embedding.weight.dtype)
+        x = torch.where(is_start[:, None], summary_token, self.token_embedding(ids))
+        positions = torch.arange(total, device=patches.device) - starts.repeat_interleave(lengths, output_size=total)
+        h = self.patch_summarizer(x[None], positions=positions, cu_seqlens=cu_seqlens, max_length=max_length)[0]
+        return self.summary_projection(h[starts])
+
+    def _local_packed(
+        self, patches: Tensor, context: Tensor, cross: CrossHook | None = None, output: OutputHook | None = None
+    ) -> tuple[Tensor, Tensor]:
+        """local_forward で各パッチの全トークンを予測するのと同じ計算を、パディングせずに 1 本につなげて行う。
+        パッチ i の入力は BOS + 自分のトークン (最後を除く)、予測の対象は自分のトークン全部。(logits [T, V], 対象 [T]) を返す。
+        cross / output は Condition.local_cross_packed / local_output_packed のフック"""
+        lengths = (patches != PAD).sum(-1)
+        cu_seqlens = F.pad(lengths.cumsum(0), (1, 0)).int()
+        total, max_length = int(cu_seqlens[-1]), int(lengths.max())
+        target = patches[patches != PAD]
+        patch = torch.repeat_interleave(torch.arange(len(patches), device=patches.device), lengths, output_size=total)
+        position = torch.arange(total, device=patches.device) - cu_seqlens[:-1].long()[patch]
+        # 1 つ前のトークンを入力にする。各パッチの先頭 (位置 0) は BOS
+        previous = torch.roll(self.token_embedding(target), 1, dims=0)
+        x = torch.where((position == 0)[:, None], self.local_bos.to(previous.dtype), previous)
+        x = x + self.local_context(context)[patch]
+        h = self.local_transformer(
+            x[None], positions=position, cross=cross, cu_seqlens=cu_seqlens, max_length=max_length
+        )[0]
+        logits = self.head(h)
+        return (output(h, logits) if output is not None else logits), target
 
     def local_step(
         self,
@@ -422,7 +605,19 @@ class PianoARModel(nn.Module):
         パッチごとのトークン長は中央値 70 前後に対して最長は 200 を超えるので、全パッチを最長に揃えると
         計算とメモリの大半がパディングに使われる。パッチを長さ順に num_length_buckets 個の塊に分け、
         塊ごとにその中の最長まで切り詰めて PatchSummarizer と Local Decoder を通す。
+
+        num_length_buckets=0 なら、パッチをパディングせずに 1 本につなげ、attention だけパッチの中に閉じて通す (パッキング)。
+        塊ごとに Transformer を呼ばないので CPU の仕事 (compile したブロックの呼び出しとカーネルの起動) が減り、
+        パディングの計算 (塊 4 つで約 3 割) もなくなる。条件 (cross-attention) は Condition の local_cross_packed /
+        local_output_packed で入れる。
         """
+        packed = num_length_buckets == 0
+        if packed and self.training and self.config.dropout > 0 and not flash_varlen_available():
+            # memory-efficient attention の可変長版は dropout のマスクが正しくないので (Block.forward)、塊 4 つに戻す
+            warnings.warn(
+                "flash attention がないので、dropout ありの学習ではパッキングを使わず塊 4 つで通す", stacklevel=2
+            )
+            packed, num_length_buckets = False, 4
         tokens = batch["tokens"]
         valid = batch["patch_valid"]
         patch_loss = batch["patch_loss"] & valid if "patch_loss" in batch else valid
@@ -440,12 +635,15 @@ class PianoARModel(nn.Module):
                 if len(index)
             ]
 
-        def summarize(patches: Tensor, buckets: list[tuple[Tensor, int]]) -> Tensor:
+        def summarize(patches: Tensor, buckets: list[tuple[Tensor, int]] | None = None) -> Tensor:
+            if packed:
+                return self._summarize_packed(patches)
+            buckets = buckets or length_buckets(patches)
             order = torch.cat([index for index, _ in buckets])
             summarized = torch.cat([self.summarize_patches(patches[index, :length]) for index, length in buckets])
             return summarized[order.argsort()]
 
-        buckets = length_buckets(flat)
+        buckets = [] if packed else length_buckets(flat)
         summarized = summarize(flat, buckets)
         summaries = summarized.new_zeros(*valid.shape, self.config.dim)
         if memory.any():
@@ -456,7 +654,7 @@ class PianoARModel(nn.Module):
             stance = "force_eager" if self.patch_summarizer.gradient_checkpointing else "default"
             with torch.no_grad(), torch.compiler.set_stance(stance):
                 patches = tokens[memory]
-                summaries[memory] = summarize(patches, length_buckets(patches)).to(summaries.dtype)
+                summaries[memory] = summarize(patches).to(summaries.dtype)
         summaries[patch_loss] = summarized
         context = self.global_forward(
             summaries,
@@ -465,28 +663,48 @@ class PianoARModel(nn.Module):
             batch["channel"],
             cross=condition.global_cross() if condition is not None else None,
             dynamics=batch.get("dynamics"),
+            bar_beats=batch.get("bar_beats"),
+            tempo=batch.get("tempo"),
         )[patch_loss]
 
         loss_sum = torch.zeros(len(self.group_names), device=tokens.device)
         counts = torch.zeros(len(self.group_names), device=tokens.device)
-        for index, length in buckets:
-            target = flat[index, :length]
-            cross = output = None
-            if condition is not None:
-                cross = condition.local_cross(trained[index], target[:, :-1])
-                output = condition.local_output(trained[index], target[:, :-1])
-            logits = self.local_forward(target[:, :-1], context[index], cross, output)
-            token_loss = F.cross_entropy(
-                logits.float().reshape(-1, self.vocab_size), target.reshape(-1), ignore_index=PAD, reduction="none"
-            )
+        correct = torch.zeros(len(self.group_names), device=tokens.device)
+
+        def add_loss(logits: Tensor, target: Tensor) -> None:
+            nonlocal loss_sum, counts, correct
+            flat_logits = logits.float().reshape(-1, self.vocab_size)
+            token_loss = F.cross_entropy(flat_logits, target.reshape(-1), ignore_index=PAD, reduction="none")
             group = self.token_group[target.reshape(-1)]
             keep = group >= 0  # PAD は除く
             loss_sum = loss_sum.index_add(0, group[keep], token_loss[keep])
             counts = counts.index_add(0, group[keep], torch.ones_like(token_loss[keep]))
+            with torch.no_grad():
+                hit = (flat_logits.argmax(-1) == target.reshape(-1)).float()
+                correct = correct.index_add(0, group[keep], hit[keep])
+
+        if packed:
+            cross = output = None
+            if condition is not None:
+                cross = condition.local_cross_packed(trained, flat)
+                output = condition.local_output_packed(trained, flat)
+            add_loss(*self._local_packed(flat, context, cross, output))
+        else:
+            for index, length in buckets:
+                target = flat[index, :length]
+                cross = output = None
+                if condition is not None:
+                    cross = condition.local_cross(trained[index], target[:, :-1])
+                    output = condition.local_output(trained[index], target[:, :-1])
+                add_loss(self.local_forward(target[:, :-1], context[index], cross, output), target)
 
         output = {"loss": loss_sum.sum() / counts.sum().clamp_min(1), "tokens": counts.sum()}
+        # 1 位の正解率。書き方が 1 つに決まらないトークンでは、損失は確信度の変化だけでも大きく動くので、並べて見る
+        output["acc"] = correct.sum() / counts.sum().clamp_min(1)
         for index, name in enumerate(self.group_names):
             output[f"loss_{name}"] = loss_sum[index] / counts[index].clamp_min(1)
+            output[f"acc_{name}"] = correct[index] / counts[index].clamp_min(1)
+            output[f"count_{name}"] = counts[index]
         return output
 
     # ------------------------------------------------------------------
@@ -519,6 +737,8 @@ class PianoARModel(nn.Module):
         end_after: int = 0,
         dynamics: Tensor | None = None,
         progress: Callable[[int, int], None] | None = None,
+        bar_beats: Tensor | None = None,
+        tempo: Tensor | None = None,
     ) -> list[list[list[int]]]:
         """曲の冒頭から生成し、サンプルごとにパッチのトークン列のリストを返す。
 
@@ -531,6 +751,8 @@ class PianoARModel(nn.Module):
         end_after を渡すと、EOS (曲の終わり) はパッチ end_after 以降でだけ出せる (カバーは原曲の長さで終わりが決まる)。
         dynamics [num_patches, C] はパッチごとの強さと音の多さなどの番号 (piano_ar.data.quantize_dynamics、0 は指定なし)。
         progress(終わったパッチ数, num_patches) はパッチを 1 つ生成するたびに呼ぶ (UI の進み具合。例外を投げれば止まる)。
+        bar_beats / tempo [num_patches] は拍のトークンのモデルでの小節の拍数とテンポの段階。小節の中の位置は
+        拍数 × ticks_per_beat 未満に絞る。
 
         条件と「演奏の仕方」(チャンネル) の強さは別々に決める (InstructPix2Pix と同じ 2 段の guidance)。
         それぞれを外したときの予測を使って
@@ -585,8 +807,14 @@ class PianoARModel(nn.Module):
             song_start_tensor = torch.full((rows,), song_start, dtype=torch.long, device=device)
             global_cross = bound.global_cross(first, p) if bound is not None else None
             window_dynamics = dynamics[first : p + 1][None].expand(rows, -1, -1) if dynamics is not None else None
+            beat_conditions = {}
+            if bar_beats is not None:
+                beat_conditions = {
+                    "bar_beats": bar_beats[first : p + 1][None].expand(rows, -1),
+                    "tempo": tempo[first : p + 1][None].expand(rows, -1),
+                }
             context = self.global_forward(
-                stacked, song_start_tensor, pedal, channels, global_cross, dynamics=window_dynamics
+                stacked, song_start_tensor, pedal, channels, global_cross, dynamics=window_dynamics, **beat_conditions
             )[:, -1]
 
             forced = None
@@ -607,6 +835,7 @@ class PianoARModel(nn.Module):
                 allow_eos=p >= end_after,
                 time_bias=time_bias[p] if time_bias is not None else None,
                 forced=forced,
+                time_limit=int(bar_beats[p]) * tokenizer.ticks_per_beat if bar_beats is not None else None,
             )
 
             pedal_down, song_end = pedal_down.tolist(), song_end.tolist()
@@ -660,8 +889,9 @@ class LocalSampler:
         allow_eos: bool = True,
         time_bias: Tensor | None = None,
         forced: Tensor | None = None,
+        time_limit: int | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        """1 パッチを生成する。context [rows, D] は Global の出力、tensors はこのパッチの StepCondition の量。
+        """1 パッチを生成する。time_limit は TIME (拍のトークンでは小節の中の位置) の上限 (これ未満だけを出す)。context [rows, D] は Global の出力、tensors はこのパッチの StepCondition の量。
         guide は rows 行の logits を samples 行にまとめる (cfg)。行 r の入力はサンプル r % samples のトークン。
         pedal_down / finished [samples] はパッチの頭のペダルと、もう曲が終わった行 (PAD だけを出す)。
         time_bias [patch_frames] は TIME の logit に足す量 (_bias_time)、forced [samples, max_patch_tokens] は
@@ -678,7 +908,7 @@ class LocalSampler:
         state.allow_eos.fill_(allow_eos)
 
         def reset() -> None:
-            state.grammar.reset(pedal_down, finished)
+            state.grammar.reset(pedal_down, finished, time_limit)
             state.step.zero_()
             state.token.zero_()
             state.sequence.fill_(PAD)

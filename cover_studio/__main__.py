@@ -17,7 +17,7 @@ import threading
 import webbrowser
 from pathlib import Path
 
-from piano_ar.hub import HF_REPO
+from piano_ar.hub import HF_REPOS
 
 from .app import create_app
 from .engine import REPO_ROOT, Engine, TsumugiSetup, find_models
@@ -43,15 +43,31 @@ def main(argv=None) -> None:
         "--checkpoints-dir",
         type=_optional_dir,
         default=REPO_ROOT / "checkpoints",
-        help="学習のチェックポイント (*/best.pt) を探すフォルダ (空文字で探さない)",
+        help="学習のチェックポイント (**/best.pt) を探すフォルダ (空文字で探さない)",
     )
-    parser.add_argument("--hub-repo", default=HF_REPO, help="Hugging Face の repository (空文字で使わない)")
+    parser.add_argument(
+        "--hub-repo",
+        nargs="*",
+        default=list(HF_REPOS),
+        help="Hugging Face の repository (並べた順に一覧の先頭に出し、最初のものが既定。何も渡さなければ使わない)",
+    )
     parser.add_argument("--device", default="auto", help="auto / cuda / cpu")
     parser.add_argument("--tsumugi-dir", type=Path, default=None, help="tsumugi のリポジトリ (既定 .tsumugi/tsumugi)")
     parser.add_argument("--tsumugi-python", type=Path, default=None, help="tsumugi の環境の Python (既定 その .venv)")
     parser.add_argument("--ffmpeg-dir", type=Path, default=None, help="FFmpeg の共有ライブラリ版の bin (Windows)")
     parser.add_argument("--tsumugi-compile", action="store_true", help="採譜で torch.compile を使う")
     parser.add_argument("--tsumugi-device", default="auto", help="採譜のデバイス (auto / cuda / cpu)")
+    parser.add_argument(
+        "--sheetsage-model",
+        default=None,
+        help="拍とメロディを予測する SheetSage2-Refined (Hugging Face の repository か手元のフォルダ。既定 anime-song/SheetSage2-Refined)",
+    )
+    parser.add_argument(
+        "--frames-pca",
+        type=Path,
+        default=None,
+        help="原曲の音声の特徴を使うモデルの、特徴を作る PCA (既定 data/audio_frames/original/pca.npz)",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8100)
     parser.add_argument("--no-browser", action="store_true")
@@ -63,7 +79,7 @@ def main(argv=None) -> None:
 
     import uvicorn
 
-    models = find_models(args.pretrained_dir, args.checkpoints_dir, args.hub_repo or None)
+    models = find_models(args.pretrained_dir, args.checkpoints_dir, [repo for repo in args.hub_repo if repo])
     tsumugi = TsumugiSetup.detect(args.tsumugi_dir, args.tsumugi_python, args.ffmpeg_dir)
     if tsumugi is not None:
         tsumugi.compile = args.tsumugi_compile
@@ -75,7 +91,7 @@ def main(argv=None) -> None:
     if not args.no_web_download:
         ensure_web()  # 無ければ GitHub の Release からビルド済みのものを取ってくる (Node.js が要らない)
 
-    app = create_app(args.root, Engine(models, args.device, tsumugi))
+    app = create_app(args.root, Engine(models, args.device, tsumugi, args.sheetsage_model, args.frames_pca))
     if not args.no_browser:
         threading.Timer(1.5, webbrowser.open, [f"http://{args.host}:{args.port}/"]).start()
     uvicorn.run(app, host=args.host, port=args.port)

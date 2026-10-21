@@ -31,6 +31,19 @@ class CoverConfig:
     # デコーダの強弱の条件 (ModelConfig.dynamics_bins) と一緒に使う
     planner_dim: int = 256
     planner_layers: int = 3
+    # cross-attention の出力のゲート (tanh) の初期値。0 なら学習の始めは事前学習モデルとまったく同じ出力になるが、
+    # ゲートが開くまで cross-attention の中の重みに勾配が流れず、原曲を使い始めるのが遅い (208M のデコーダでは
+    # step 3000 でもゲート 0.004 で、原曲ありとなしの損失の差は 0.017)。重みを読み込むときは保存した値が使われるので、
+    # 学習の始めだけに効く
+    cross_gate_init: float = 0.0
+    # 原曲の音声の特徴 (piano_cover.audio_frames の PCA 後の次元、0 で使わない) と、1 パッチに入れる特徴の行の上限。
+    # 特徴の行は原曲の行と一緒に原曲エンコーダに入り、Local の cross-attention からも見える
+    frame_dims: int = 0
+    max_frame_rows: int = 128
+    # 原曲の行に SheetSage2-Refined の注釈を使って学習したか (キャッシュの meta.json の sheetsage から決まる)。
+    # 生成でも同じ形の行を作る: beats なら拍を SheetSage のものに置き換え、melody ならメロディの音を足す
+    sheetsage_beats: bool = False
+    sheetsage_melody: bool = False
 
     @classmethod
     def from_dict(cls, values: dict) -> CoverConfig:

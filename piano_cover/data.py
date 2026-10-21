@@ -31,11 +31,15 @@ from .arrangement import ARRANGEMENT_NAMES, arrangement_values, map_to_source
 from .config import CoverConfig
 from .rollout import Rollout, RolloutBank
 from .source import (
+    INSTRUMENT_ID,
+    ROW_D,
     ROW_TYPE,
     TYPE_BEAT,
     TYPE_CHORD,
     TYPE_KEY,
+    TYPE_NOTE,
     SourceVocab,
+    is_sheetsage,
     sort_rows,
     source_features,
     stretch_rows,
@@ -43,6 +47,7 @@ from .source import (
 )
 
 SPLITS = {"train": 0, "val": 1, "test": 2}
+MELODY_ID = INSTRUMENT_ID["melody"]
 
 
 @dataclass(frozen=True)
@@ -180,12 +185,16 @@ def patch_sync(
 
 
 def source_tensors(features: dict[str, np.ndarray]) -> dict[str, torch.Tensor]:
-    return {
+    out = {
         "src_features": torch.from_numpy(features["features"]),
         "src_onset": torch.from_numpy(features["onset"]),
         "src_valid": torch.from_numpy(features["valid"]),
         "src_patch_valid": torch.ones(features["features"].shape[0], dtype=torch.bool),
     }
+    if "frames" in features:  # 原曲の音声の特徴の行 (source_features の frames)
+        out["src_frame_index"] = torch.from_numpy(features["frame_index"])
+        out["src_frames"] = torch.from_numpy(features["frames"])
+    return out
 
 
 class CoverWindowDataset(Dataset):
@@ -193,7 +202,8 @@ class CoverWindowDataset(Dataset):
 
     学習用は窓の位置がランダムで、原曲とカバーに同じ時間伸縮・移調をかける (ベロシティのずらしはカバーだけ)。
     source_dropout の確率で原曲を外し (CFG 用)、structure_dropout の確率で拍・コード・キーをそれぞれ外す
-    (推定値なので、なくても動くようにする)。
+    (推定値なので、なくても動くようにする)。melody_dropout の確率で、tsumugi のメロディと SheetSage のメロディを
+    それぞれ外す (片方が間違っていても、もう片方や伴奏から弾けるようにする)。
     pretraining を渡すと、index が カバーの数 以上のときは事前学習の曲を原曲なしで返す (忘却を防ぐため混ぜる)。
     drift を渡すと、窓の前半のカバーの時刻をずらして後半で原曲に戻らせる (DriftConfig)。検証では窓ごとに決まった乱数で
     ずらすので、毎回同じ窓になる。
@@ -221,6 +231,7 @@ class CoverWindowDataset(Dataset):
         channel_dropout: float = 0.15,
         source_dropout: float = 0.1,
         structure_dropout: float = 0.2,
+        melody_dropout: float = 0.0,
         pretraining: PianoWindowDataset | None = None,
         drift: DriftConfig | None = None,
         memory_patches: int = 0,
@@ -253,6 +264,7 @@ class CoverWindowDataset(Dataset):
         self.channel_dropout = channel_dropout if self.train else 0.0
         self.source_dropout = source_dropout
         self.structure_dropout = structure_dropout if self.train else 0.0
+        self.melody_dropout = melody_dropout if self.train else 0.0
         self.covers = np.flatnonzero(cache.split == SPLITS[split])
         self.pretraining = pretraining
         self.drift = drift
@@ -356,6 +368,13 @@ class CoverWindowDataset(Dataset):
             for row_type in (TYPE_BEAT, TYPE_CHORD, TYPE_KEY):
                 if random.random() < self.structure_dropout:
                     rows = rows[rows[:, ROW_TYPE] != row_type]
+            if self.melody_dropout > 0:
+                tsumugi = (rows[:, ROW_TYPE] == TYPE_NOTE) & (rows[:, ROW_D] == MELODY_ID)
+                drop = np.zeros(len(rows), dtype=bool)
+                for melody in (tsumugi, is_sheetsage(rows)):
+                    if random.random() < self.melody_dropout:
+                        drop |= melody
+                rows = rows[~drop]
             features = source_features(rows, source_end, self.tokenizer, self.vocab, self.cover_config.max_source_rows)
             source_items = source_tensors(features)
             if self.dynamics_bins:
@@ -449,7 +468,16 @@ class CoverWindowDataset(Dataset):
         return patch_loss
 
 
-SOURCE_KEYS = ("src_features", "src_onset", "src_valid", "src_patch_valid", "plan_target")
+SOURCE_KEYS = (
+    "src_features",
+    "src_onset",
+    "src_valid",
+    "src_patch_valid",
+    "plan_target",
+    "src_patch_start",
+    "src_frame_index",
+    "src_frames",
+)
 
 
 def collate_cover(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
@@ -468,6 +496,26 @@ def collate_cover(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tenso
         valid[i, :s, :r] = item["src_valid"]
         patch_valid[i, :s] = item["src_patch_valid"]
     out.update(src_features=features, src_onset=onset, src_valid=valid, src_patch_valid=patch_valid)
+    if any("src_patch_start" in item for item in batch):  # 拍のトークン: 原曲の小節の頭の刻み
+        starts = torch.zeros(len(batch), num_patches, dtype=torch.long)
+        for i, item in enumerate(batch):
+            if "src_patch_start" in item:
+                starts[i, : len(item["src_patch_start"])] = item["src_patch_start"]
+        out["src_patch_start"] = starts
+    if any("src_frames" in item for item in batch):
+        # 原曲の音声の特徴: 曲ごとの特徴をつなげ、行の番号をつなげた中の番号にする (特徴のない行は -1)
+        frame_index = torch.full((len(batch), num_patches, num_rows), -1, dtype=torch.int32)
+        frames, total = [], 0
+        for i, item in enumerate(batch):
+            if "src_frames" not in item:
+                continue
+            index = item["src_frame_index"]
+            s, r = index.shape
+            frame_index[i, :s, :r] = torch.where(index >= 0, index + total, -1)
+            frames.append(item["src_frames"])
+            total += len(item["src_frames"])
+        out["src_frame_index"] = frame_index
+        out["src_frames"] = torch.cat(frames)
     if any("plan_target" in item for item in batch):
         # 原曲のない行 (事前学習の曲) の正解は列が少ない (すべて NaN) ので、一番多い列に合わせる
         columns = max(item["plan_target"].shape[1] for item in batch if "plan_target" in item)

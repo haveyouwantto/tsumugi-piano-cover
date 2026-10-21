@@ -2,8 +2,8 @@
 
 モデルの候補 (find_models):
   export     piano_cover.export の出力 (既定 pretrained/ の下)
-  checkpoint 学習のチェックポイント (既定 checkpoints/*/best.pt。隣に planner*.pt があれば差し替えた版も)
-  hub        Hugging Face に公開した重み (piano_ar.hub.HF_REPO。初回にダウンロードする)
+  checkpoint 学習のチェックポイント (既定 checkpoints/**/best.pt。隣に planner*.pt があれば差し替えた版も)
+  hub        Hugging Face に公開した重み (piano_ar.hub.HF_REPOS の V2・V1。初回にダウンロードする)。一覧の先頭 (既定) は V2
 """
 
 from __future__ import annotations
@@ -28,6 +28,8 @@ from .project import Project
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKER = Path(__file__).resolve().parent / "tsumugi_worker.py"
+# 原曲の MIDI に書く SheetSage の拍の形 (小節ごとに 1 つのテンポ)。変えたら既存のプロジェクトの MIDI とテイクを書き直す
+BEATS_MAP = "bar"
 
 
 class Cancelled(Exception):
@@ -57,8 +59,17 @@ def _is_cover_checkpoint(path: Path) -> bool:
         return False
 
 
-def find_models(pretrained_dir: Path | None, checkpoints_dir: Path | None, hub_repo: str | None) -> list[ModelEntry]:
-    entries: list[ModelEntry] = []
+def find_models(
+    pretrained_dir: Path | None, checkpoints_dir: Path | None, hub_repos: list[str] | tuple[str, ...]
+) -> list[ModelEntry]:
+    """画面の一覧の先頭が既定のモデルになるので、Hugging Face の公開した重み (hub_repos の順) を先に並べる"""
+    from piano_ar.hub import HF_REPO_V1, HF_REPO_V2
+
+    names = {HF_REPO_V2: "V2", HF_REPO_V1: "V1"}
+    entries: list[ModelEntry] = [
+        ModelEntry(f"hub:{repo}", f"{names[repo]} ({repo})" if repo in names else f"{repo} (Hugging Face)", "hub", repo)
+        for repo in hub_repos
+    ]
     if pretrained_dir is not None and pretrained_dir.is_dir():
         for config_path in sorted(pretrained_dir.rglob("config.json")):
             try:
@@ -75,7 +86,7 @@ def find_models(pretrained_dir: Path | None, checkpoints_dir: Path | None, hub_r
                 )
             )
     if checkpoints_dir is not None and checkpoints_dir.is_dir():
-        found = [p for p in checkpoints_dir.glob("*/best.pt") if _is_cover_checkpoint(p)]
+        found = [p for p in checkpoints_dir.rglob("best.pt") if _is_cover_checkpoint(p)]
         for path in sorted(found, key=lambda p: p.stat().st_mtime, reverse=True):
             rel = path.relative_to(checkpoints_dir).as_posix()
             entries.append(ModelEntry(f"checkpoint:{rel}", rel, "checkpoint", str(path)))
@@ -91,8 +102,6 @@ def find_models(pretrained_dir: Path | None, checkpoints_dir: Path | None, hub_r
                         str(planner),
                     )
                 )
-    if hub_repo:
-        entries.append(ModelEntry(f"hub:{hub_repo}", f"{hub_repo} (Hugging Face)", "hub", hub_repo))
     return entries
 
 
@@ -129,10 +138,15 @@ class Engine:
         models: list[ModelEntry],
         device: str = "auto",
         tsumugi: TsumugiSetup | None = None,
+        sheetsage_model: str | None = None,
+        frames_pca: Path | None = None,
     ) -> None:
         self.models = models
         self.device_name = device
         self.tsumugi = tsumugi
+        self.sheetsage_model = sheetsage_model  # None なら sheetsage2_refined の既定 (Hugging Face)
+        # 原曲の音声の特徴を使うモデル (frame_dims) の、特徴を作る PCA (piano_cover.audio_frames fit の出力)
+        self.frames_pca = frames_pca or REPO_ROOT / "data" / "audio_frames" / "original" / "pca.npz"
         self._model = None
         self._model_id: str | None = None
         self._sources: OrderedDict[tuple, object] = OrderedDict()
@@ -188,17 +202,130 @@ class Engine:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _source(self, project: Project, model):
+    def _source(self, project: Project, model, progress: Callable[[float, str], None], log: Callable[[str], None]):
+        from piano_ar.beat_tokenizer import BeatTokenizer
         from piano_cover.generate import prepare_source
 
+        self._source_beats(project, progress, log)
         path = project.source_path
-        key = (str(path), path.stat().st_mtime_ns, self._model_id)
+        annotation = None
+        c = model.config
+        if c.sheetsage_beats or c.sheetsage_melody or isinstance(model.tokenizer, BeatTokenizer):
+            annotation = self._sheetsage(project, progress, log)
+        key = (
+            str(path),
+            path.stat().st_mtime_ns,
+            self._model_id,
+            annotation and (str(annotation), annotation.stat().st_mtime_ns),
+        )
+        frames = self._frames(project, progress, log) if c.frame_dims else None
+        if frames is not None:
+            key += (str(frames), frames.stat().st_mtime_ns)
         if key not in self._sources:
-            self._sources[key] = prepare_source(path, model.tokenizer, model.config)
+            self._sources[key] = prepare_source(
+                path, model.tokenizer, model.config, annotation, np.load(frames)["frames"] if frames else None
+            )
             while len(self._sources) > 8:
                 self._sources.popitem(last=False)
         self._sources.move_to_end(key)
         return self._sources[key]
+
+    def _source_beats(
+        self, project: Project, progress: Callable[[float, str], None], log: Callable[[str], None]
+    ) -> None:
+        """原曲の MIDI の拍 (テンポと拍子) を、音源から予測した SheetSage2-Refined の拍にする (音などの秒の位置は変えない)。
+        画面の拍の線・カバーの MIDI に写すテンポと拍子・V1 のモデルが読む拍が、どれも SheetSage の拍になる。
+        音源のないプロジェクトは tsumugi の拍のまま。音源と書き方 (beats_map、小節ごとのテンポは "bar") ごとに 1 回だけ
+        (source の beats に印を付ける)"""
+        from piano_cover.metadata import apply_sheetsage_beats
+
+        audio = project.audio_path
+        if audio is None or not audio.is_file() or not project.has_source:
+            return
+        source = project.data.get("source") or {}
+        sha1 = project.data.get("audio_sha1")
+        if (
+            source.get("beats") == "sheetsage"
+            and source.get("beats_audio_sha1") == sha1
+            and source.get("beats_map") == BEATS_MAP
+        ):
+            return
+        annotation = json.loads(self._sheetsage(project, progress, log).read_text(encoding="utf-8"))
+        if apply_sheetsage_beats(project.source_path, annotation):
+            project.update(source={**source, "beats": "sheetsage", "beats_audio_sha1": sha1, "beats_map": BEATS_MAP})
+            log("原曲の MIDI の拍を SheetSage2-Refined の拍にしました")
+
+    def _sheetsage(self, project: Project, progress: Callable[[float, str], None], log: Callable[[str], None]) -> Path:
+        """原曲の音声の拍とメロディを SheetSage2-Refined (HeadBeats / HeadMelody) で予測し、project/sheetsage.json に置く。
+        音声が同じ (audio_sha1) なら前回の結果を使う"""
+        out = project.dir / "sheetsage.json"
+        audio = project.audio_path
+        sha1 = project.data.get("audio_sha1")
+        if out.is_file() and (audio is None or json.loads(out.read_text(encoding="utf-8")).get("audio_sha1") == sha1):
+            return out
+        if audio is None or not audio.is_file():
+            raise FileNotFoundError(
+                "このモデルは原曲の音声から拍とメロディを予測して使います。音源のあるプロジェクトで生成してください"
+            )
+        import torch
+
+        from piano_ar.sheetsage import SheetSageAnnotator
+
+        progress(0.0, "beats")  # 画面が言語に合わせて訳す (web/src/i18n.ts の progressText)
+        log(f"原曲の拍とメロディを予測しています: {audio.name}")
+        annotator = SheetSageAnnotator(self.sheetsage_model, device=str(self.device))
+        try:
+            result = annotator.annotate(audio)
+        finally:
+            del annotator
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        result["audio_sha1"] = sha1
+        tmp = out.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(out)
+        log(f"拍 {len(result['beats'])}・メロディ {len(result['melody'])} 音")
+        return out
+
+    def _frames(self, project: Project, progress: Callable[[float, str], None], log: Callable[[str], None]) -> Path:
+        """原曲の音声の特徴 (piano_cover.audio_frames) を作り、project/frames.npz に置く。
+        音声 (audio_sha1) と PCA が同じなら前回の結果を使う"""
+        import hashlib
+
+        out = project.dir / "frames.npz"
+        audio = project.audio_path
+        # 公開した重みは重みの隣の PCA、学習のチェックポイントは --frames-pca (既定は手元で作ったもの)
+        pca = Path(getattr(self._model, "frames_pca_path", None) or self.frames_pca)
+        if not pca.is_file():
+            raise FileNotFoundError(f"原曲の音声の特徴を作る PCA がありません: {pca} (--frames-pca で指定)")
+        sha1 = project.data.get("audio_sha1")
+        pca_sha1 = hashlib.sha1(pca.read_bytes()).hexdigest()
+        if out.is_file():
+            saved = np.load(out)
+            if str(saved["audio_sha1"]) == str(sha1) and str(saved["pca_sha1"]) == pca_sha1:
+                return out
+        if audio is None or not audio.is_file():
+            raise FileNotFoundError("このモデルは原曲の音声の特徴を使います。音源のあるプロジェクトで生成してください")
+        import torch
+
+        from piano_cover.audio_frames import FrameExtractor, FrameProjector
+
+        progress(0.0, "beats")
+        log(f"原曲の音声の特徴を作っています: {audio.name}")
+        extractor = FrameExtractor(self.sheetsage_model, device=str(self.device))
+        try:
+            frames = FrameProjector(extractor, pca)(audio)
+        finally:
+            del extractor
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        tmp = out.with_suffix(".tmp.npz")
+        np.savez(tmp, frames=frames, audio_sha1=np.str_(sha1), pca_sha1=np.str_(pca_sha1))
+        tmp.replace(out)
+        log(f"特徴 {len(frames)} フレーム")
+        return out
 
     # ------------------------------------------------------------ 生成
     def generate(
@@ -215,7 +342,7 @@ class Engine:
         from piano_ar.evaluation import events_end_frame
         from piano_ar.tokenizer import KIND, KIND_NOTE
         from piano_cover.generate import CoverParams, generate_covers
-        from piano_cover.metadata import copy_metadata
+        from piano_cover.metadata import score_for_cover
 
         with self._lock:
             first = project.take(take_ids[0])
@@ -225,7 +352,7 @@ class Engine:
             params = CoverParams.from_dict(first["params"])
             if params.channel and entry.num_channels and params.channel >= entry.num_channels:
                 raise ValueError(f"演奏者の番号は 1〜{entry.num_channels - 1} です")
-            source = self._source(project, model)
+            source = self._source(project, model, progress, log)
             tokenizer = model.tokenizer
             frame_rate = tokenizer.config.frame_rate
 
@@ -234,7 +361,11 @@ class Engine:
             if keep:
                 # 指定した時刻を含まないパッチまで (生成は原曲の最初の音から始まるので lead を引く)
                 patches = project.take_patches(keep["take"])
-                count = int((keep["seconds"] * frame_rate - source.lead) // tokenizer.patch_frames)
+                if source.grid is not None:
+                    starts = source.grid.beats[source.grid.bar_starts]
+                    count = int(np.searchsorted(starts, keep["seconds"] * frame_rate, side="right") - 1)
+                else:
+                    count = int((keep["seconds"] * frame_rate - source.lead) // tokenizer.patch_frames)
                 prompt = patches[: max(0, min(count, len(patches)))] or None
 
             for take_id in take_ids:
@@ -243,8 +374,14 @@ class Engine:
             def on_patch(done: int, total: int) -> None:
                 if should_stop():
                     raise Cancelled()
-                seconds = tokenizer.config.patch_seconds
-                progress(done / total, f"{done * seconds:.0f}/{total * seconds:.0f}")  # 生成した秒数/全体の秒数
+                if source.grid is not None:
+                    starts = source.grid.beats[source.grid.bar_starts]
+                    elapsed = starts[min(done, len(starts) - 1)] / frame_rate
+                    duration = starts[min(total, len(starts) - 1)] / frame_rate
+                else:
+                    elapsed = done * tokenizer.config.patch_seconds
+                    duration = total * tokenizer.config.patch_seconds
+                progress(done / total, f"{elapsed:.0f}/{duration:.0f}")
 
             seed = first["seed"]
             torch.manual_seed(seed)
@@ -252,12 +389,28 @@ class Engine:
             np.random.seed(seed % (2**32))
             covers = generate_covers(model, source, params, num_samples=len(take_ids), prompt=prompt, progress=on_patch)
 
+        # 原曲のメタデータ (テンポ・拍子・調・コードマーカー) は、書き出す前に Score に入れて
+        # 1 回だけ書き出す。書き出してから写すと秒 -> tick の丸めが 2 回起きて、音が少しずつずれる
+        source_score = None
+        if project.has_source:
+            try:
+                from symusic import Score
+
+                source_score = Score(str(project.source_path)).to("second")
+            except Exception:
+                log("原曲のメタデータを読めなかったので、メタデータなしで書き出します")
+        source_created = (project.data.get("source") or {}).get("created")
+        source_beats = (project.data.get("source") or {}).get("beats_map")
+
         for take_id, cover in zip(take_ids, covers):
             d = project.take_dir(take_id)
-            tokenizer.events_to_midi(cover.events, d / "cover.mid")
-            # 原曲のテンポ・拍子・調・コードマーカーを写す (ないと既定の 120 bpm で開かれる)
-            if project.has_source:
-                copy_metadata(project.source_path, d / "cover.mid")
+            try:
+                score_for_cover(tokenizer, cover.events, source_score).dump_midi(str(d / "cover.mid"))
+                metadata_copied = source_score is not None
+            except Exception:  # メタデータを写せなくても、テイクは落とさない
+                log("原曲のメタデータを写せなかったので、メタデータなしで書き出します")
+                tokenizer.events_to_midi(cover.events, d / "cover.mid")
+                metadata_copied = False
             (d / "patches.json").write_text(json.dumps(cover.patches), encoding="utf-8")
             notes = int((cover.events[:, KIND] == KIND_NOTE).sum()) if len(cover.events) else 0
             project.update_take(
@@ -265,6 +418,10 @@ class Engine:
                 state="done",
                 duration=events_end_frame(cover.events) / frame_rate if len(cover.events) else 0.0,
                 notes=notes,
+                # どの原曲から作ったかと、メタデータを入れ終えた印 (古いテイクを後から直すときに使う)
+                source_created=source_created,
+                source_beats=source_beats,
+                metadata_copied=metadata_copied,
             )
 
     # ------------------------------------------------------------ 採譜
@@ -352,6 +509,7 @@ class Engine:
             # ネイティブ側の後始末で落ちることがある (0xC0000409 など)。出力はできているので中身を優先する
             log(f"tsumugi は終了コード {code} で終わりましたが、MIDI はできています")
         project.set_source(out, "tsumugi")
+        self._source_beats(project, progress, log)
         out.unlink()
 
     def describe(self) -> dict:

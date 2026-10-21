@@ -36,6 +36,16 @@ log = logging.getLogger(__name__)
 API_VERSION = 2
 AUDIO_EXTS = (".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac")
 MIDI_EXTS = (".mid", ".midi")
+# 画面の設定の既定値 (CoverParams の既定値のうち、Cover Studio だけで変えるもの)。拍のトークンのモデル (b4 / 5a) を
+# 聴いて決めた: 原曲のリズムに寄せ、強弱と編曲の性質は学習データのまま。演奏者は公開番号 227 (Hugging Face の V1 / V2 の
+# 番号。学習のチェックポイントは学習時の番号なので、同じ 227 でも別の演奏者になる)
+STUDIO_DEFAULTS = {"onset_bias": 4.0, "dynamics": 1.0, "fill": 0.0, "span": 0.0, "channel": 227, "top_p": 1.0}
+
+
+def studio_params(values: dict | None = None) -> dict:
+    from piano_cover.generate import CoverParams
+
+    return asdict(CoverParams.from_dict({**STUDIO_DEFAULTS, **(values or {})}))
 
 
 class ContinueFrom(BaseModel):
@@ -186,11 +196,9 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
     # ------------------------------------------------------------ 設定
     @app.get("/api/config")
     def config():
-        from piano_cover.generate import CoverParams
-
         return {
             **engine.describe(),
-            "defaults": asdict(CoverParams()),
+            "defaults": studio_params(),
             "busy": any(j.active for j in runner.jobs()),
             "api_version": API_VERSION,
         }
@@ -312,8 +320,6 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
     # ------------------------------------------------------------ テイク
     @app.post("/api/projects/{pid}/takes")
     def generate(pid: str, body: GenerateIn):
-        from piano_cover.generate import CoverParams
-
         p = open_project(pid)
         if not p.has_source:
             raise HTTPException(400, "原曲の MIDI がまだありません")
@@ -328,7 +334,7 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
                 raise HTTPException(404, f"テイクがありません: {body.continue_from.take}") from e
             if source_take["state"] != "done":
                 raise HTTPException(400, "生成が終わったテイクからだけ続きを作れます")
-        params = asdict(CoverParams.from_dict(body.params))
+        params = studio_params(body.params)
         record = {
             "params": params,
             "model": {"id": entry.id, "label": entry.label},
@@ -367,12 +373,24 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
         path = p.take_midi(tid)
         if not path.is_file():
             raise HTTPException(404, "まだ生成していません")
-        # 以前に生成したテイクはメタデータなしで保存されているので、取り出すときに写す
-        if p.has_source:
+        # メタデータなしで書かれた古いテイクだけ、ここで 1 回だけ直す (書き込みは一時ファイル -> 置換)。
+        # 毎回書き直すと秒 -> tick の丸めが積もって音が少しずつずれるうえ、同時のダウンロードと
+        # ぶつかって書きかけのファイルを返すことがある。直したら take.json に印を残す。
+        source_created = (p.data.get("source") or {}).get("created")
+        recorded = take.get("source_created")
+        if recorded is not None:
+            same_source = recorded == source_created
+        else:  # 印がない古いテイク: 原曲がテイクより後に作られていれば、別の原曲に入れ替わっている
+            same_source = source_created is None or source_created <= (take.get("created") or "")
+        # 原曲の拍を書き直した (SheetSage の拍にした・小節ごとのテンポにした) 後のテイクも、同じように 1 回だけ写し直す
+        source_beats = (p.data.get("source") or {}).get("beats_map")
+        stale = not take.get("metadata_copied") or take.get("source_beats") != source_beats
+        if p.has_source and stale and same_source:
             try:
                 from piano_cover.metadata import copy_metadata
 
                 copy_metadata(p.source_path, path)
+                p.update_take(tid, metadata_copied=True, source_beats=source_beats)
             except Exception:  # 写せなくても、中身 (音) は返す
                 log.exception("cover.mid にメタデータを写せませんでした: %s", path)
         name = f"{safe_name(p.data['title'])}_{take['name'] or tid}.mid"

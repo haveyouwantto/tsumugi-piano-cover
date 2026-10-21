@@ -12,6 +12,7 @@ import copy
 import math
 import re
 import xml.etree.ElementTree as ET
+import zipfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -241,7 +242,15 @@ def _duration(note: ET.Element, grace: ET.Element | None) -> Duration | None:
     tuplet = None
     if modification is not None:
         tuplet = (int(modification.findtext("actual-notes")), int(modification.findtext("normal-notes")))
+        if tuplet[0] == tuplet[1]:
+            tuplet = None  # 6:6 や 4:4 (書き出しのソフトによる見かけだけの連符) はふつうの音符
+        elif tuplet not in TUPLETS:
+            # 8:12 -> 2:3、9:6 -> 3:2 のように約すと語彙にある比になるもの
+            divisor = math.gcd(*tuplet)
+            tuplet = (tuplet[0] // divisor, tuplet[1] // divisor)
     grace_kind = None if grace is None else ("slash" if grace.get("slash") == "yes" else "grace")
+    if grace_kind and note_type in ("64th", "128th"):
+        note_type = "32nd"  # 装飾音の種類は 32 分までにまとめる
     return Duration(note_type, len(note.findall("dot")), tuplet, grace_kind)
 
 
@@ -495,10 +504,21 @@ def _clean_group(group: _RawGroup, length: Fraction) -> _RawGroup | None:
 
 
 def parse_xml(path: str | Path) -> ET.Element:
+    """MusicXML を読む。圧縮された .mxl (zip の中の META-INF/container.xml が本体を指す) も読める
+    (拡張子が .mxl でも zip でなければ、そのまま XML として読む)"""
     try:
+        if str(path).lower().endswith(".mxl") and zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as archive:
+                container = ET.fromstring(archive.read("META-INF/container.xml"))
+                rootfile = container.find(".//rootfile")
+                if rootfile is None:
+                    raise ScoreError(".mxl の本体が見つからない")
+                return ET.fromstring(archive.read(rootfile.get("full-path")))
         return ET.parse(path).getroot()
     except ET.ParseError as e:
         raise ScoreError(f"XML として読めない: {e}")
+    except (zipfile.BadZipFile, KeyError) as e:
+        raise ScoreError(f".mxl として読めない: {e}")
 
 
 def score_title(root: ET.Element) -> str:
@@ -515,9 +535,12 @@ def score_title(root: ET.Element) -> str:
     return max(credits)[1] if credits else ""
 
 
-def read_musicxml(source: str | Path | ET.Element, unfold: bool = True, visible_only: bool = False) -> list[Measure]:
+def read_musicxml(
+    source: str | Path | ET.Element, unfold: bool = True, visible_only: bool = False, order: list[int] | None = None
+) -> list[Measure]:
     """MusicXML (パスか読み込み済みの要素) を読む。unfold=True なら反復記号を展開した演奏順の小節にする。
-    visible_only=True なら、見えない音符と cue サイズの音符 (_hidden_note) を休符として読む"""
+    visible_only=True なら、見えない音符と cue サイズの音符 (_hidden_note) を休符として読む。
+    order (MusicXML の小節の並びの番号、0 から) を渡すと、反復記号の代わりにその順に並べる (実際の演奏が弾いた順など)"""
     root = source if isinstance(source, ET.Element) else parse_xml(source)
     if root.tag != "score-partwise":
         raise ScoreError(f"{root.tag} には対応していない")
@@ -646,11 +669,11 @@ def read_musicxml(source: str | Path | ET.Element, unfold: bool = True, visible_
 
     for measure in measures:
         _check_voices(measure)
-    if unfold:
+    if unfold or order is not None:
         # 2 回目以降に出てくる小節は別のものにする (スラーの後始末で塊ごとに数を変えるため)
         seen: set[int] = set()
         unfolded = []
-        for i in _unfold(raw_measures):
+        for i in _unfold(raw_measures) if order is None else order:
             unfolded.append(copy.deepcopy(measures[i]) if i in seen else measures[i])
             seen.add(i)
         measures = unfolded
