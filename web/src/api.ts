@@ -27,7 +27,7 @@ export type ModelEntry = {
 };
 
 // cover_studio/app.py の API_VERSION と同じにする (違えばサーバが古い)
-export const API_VERSION = 3;
+export const API_VERSION = 4;
 
 export type Config = {
   models: ModelEntry[];
@@ -93,6 +93,7 @@ export type ProjectDetail = {
   title: string;
   created: string;
   audio: string | null;
+  audio_sha1: string | null;
   source: { origin: string; created: string } | null;
   transcribe: Transcribe | null;
   takes: Take[];
@@ -183,6 +184,11 @@ export const api = {
   transcribe: (pid: string) => request<ProjectDetail>(`${p(pid)}/transcribe`, { method: "POST" }),
   transcribeLive: (pid: string, since: number) =>
     request<LiveTranscriptionData>(`${p(pid)}/transcribe/live?since=${since}`),
+  uploadAudio: (pid: string, file: File) => {
+    const form = new FormData();
+    form.append("audio", file);
+    return request<ProjectDetail>(`${p(pid)}/audio`, { method: "PUT", body: form });
+  },
   uploadSource: (pid: string, file: File) => {
     const form = new FormData();
     form.append("midi", file);
@@ -208,7 +214,7 @@ export const api = {
 };
 
 export const urls = {
-  audio: (pid: string) => `${p(pid)}/audio`,
+  audio: (pid: string, version?: string | null) => `${p(pid)}/audio${version ? `?v=${encodeURIComponent(version)}` : ""}`,
   sourceMidi: (pid: string) => `${p(pid)}/source.mid`,
   takeMidi: (pid: string, tid: string) => `${p(pid)}/takes/${tid}/cover.mid`,
   takeScore: (pid: string, tid: string) => `${p(pid)}/takes/${tid}/score.musicxml`,

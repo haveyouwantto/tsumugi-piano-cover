@@ -2,7 +2,8 @@
 
   設定         : GET /api/config、POST /api/engine/unload
   プロジェクト : GET/POST /api/projects、GET/PATCH/DELETE /api/projects/{pid}
-  原曲         : POST …/transcribe、PUT …/source (手元の MIDI)、GET …/audio、…/source.mid、…/source/view
+  原曲         : POST …/transcribe、PUT …/audio (音源の追加・差し替え)、PUT …/source (手元の MIDI)、
+                 GET …/audio、…/source.mid、…/source/view
   テイク       : POST …/takes (生成)、PATCH/DELETE …/takes/{tid}、GET …/takes/{tid}/cover.mid、…/view
   ジョブ       : GET /api/jobs、DELETE /api/jobs/{id} (取り消し・停止)
 
@@ -33,7 +34,7 @@ from .web import STATIC_DIR
 log = logging.getLogger(__name__)
 
 # API を変えたら上げる。画面 (web/src/api.ts の API_VERSION) と違えば、画面がサーバの起動し直しを促す
-API_VERSION = 3
+API_VERSION = 4
 AUDIO_EXTS = (".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac")
 MIDI_EXTS = (".mid", ".midi")
 # 画面の設定の既定値 (CoverParams の既定値のうち、Cover Studio だけで変えるもの)。拍のトークンのモデル (b4 / 5a) を
@@ -182,6 +183,7 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
             "title": data["title"],
             "created": data["created"],
             "audio": p.audio_path.name if p.audio_path else None,
+            "audio_sha1": data.get("audio_sha1") if p.audio_path else None,
             "source": data.get("source") if p.has_source else None,
             "transcribe": transcribe,
             "takes": takes,
@@ -316,6 +318,19 @@ def create_app(root: str | Path, engine: Engine) -> FastAPI:
         path = save_upload(midi, MIDI_EXTS)
         try:
             p.set_source(path, "upload")
+        finally:
+            shutil.rmtree(path.parent, ignore_errors=True)
+        return detail(p)
+
+    @app.put("/api/projects/{pid}/audio")
+    def upload_audio(pid: str, audio: Annotated[UploadFile, File()]):
+        """音源を後から追加する。既にある場合は置き換える。"""
+        p = open_project(pid)
+        if runner.active_for(pid):
+            raise HTTPException(409, "実行中・待ちのジョブがあるため、音源を差し替えられません")
+        path = save_upload(audio, AUDIO_EXTS)
+        try:
+            p.set_audio(path)
         finally:
             shutil.rmtree(path.parent, ignore_errors=True)
         return detail(p)

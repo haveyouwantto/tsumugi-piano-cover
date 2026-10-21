@@ -126,8 +126,8 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
   }, [takeView.data, selectedTake?.state, player]);
 
   useEffect(() => {
-    void player.setOriginal(data?.audio ? urls.audio(pid) : null);
-  }, [pid, data?.audio, player]);
+    void player.setOriginal(data?.audio ? urls.audio(pid, data.audio_sha1) : null);
+  }, [pid, data?.audio, data?.audio_sha1, player]);
 
   // 採譜 MIDI (tsumugi の出力)。原曲の時間軸なので、原曲やカバーと同じ秒で鳴る
   useEffect(() => {
@@ -311,6 +311,13 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
               </div>
             </div>
             <div className="song-actions">
+              <AudioUpload
+                pid={pid}
+                hasAudio={!!data.audio}
+                disabled={data.busy}
+                onDone={refresh}
+                onError={setError}
+              />
               {data.source && (
                 <a className="btn small" href={urls.sourceMidi(pid)} download>
                   <Icon name="download" size={15} /> {t.sourceMidi}
@@ -507,6 +514,55 @@ export function Studio({ pid, config, navigate }: { pid: string; config: Config;
                 ? t.original
                 : t.chooseTake
         }
+      />
+    </>
+  );
+}
+
+function AudioUpload({
+  pid,
+  hasAudio,
+  disabled,
+  onDone,
+  onError,
+}: {
+  pid: string;
+  hasAudio: boolean;
+  disabled: boolean;
+  onDone: (d: ProjectDetail) => void;
+  onError: (m: string) => void;
+}) {
+  const t = useT();
+  const input = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
+  return (
+    <>
+      <button
+        className="btn small"
+        disabled={disabled || busy}
+        onClick={() => input.current?.click()}
+        title={t.replaceAudioHelp}
+      >
+        <Icon name="music" size={15} /> {busy ? t.uploading : hasAudio ? t.replaceAudio : t.addAudio}
+      </button>
+      <input
+        ref={input}
+        type="file"
+        accept=".mp3,.wav,.flac,.m4a,.ogg,.opus,.aac"
+        hidden
+        onChange={async (e) => {
+          const file = e.target.files?.[0];
+          e.target.value = "";
+          if (!file || (hasAudio && !confirm(t.confirmReplaceAudio))) return;
+          setBusy(true);
+          try {
+            onDone(await api.uploadAudio(pid, file));
+          } catch (err) {
+            onError(err instanceof Error ? err.message : String(err));
+          } finally {
+            setBusy(false);
+          }
+        }}
       />
     </>
   );

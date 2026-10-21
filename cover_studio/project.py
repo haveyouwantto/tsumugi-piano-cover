@@ -18,6 +18,7 @@ import json
 import re
 import shutil
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -134,6 +135,22 @@ class Project:
         shutil.copy2(midi, tmp)
         tmp.replace(self.source_path)
         self.update(source={"origin": origin, "created": now()})
+
+    def set_audio(self, audio: Path) -> None:
+        """音源を追加する。既にあれば置き換え、古い音源のファイルは消す。"""
+        audio_dir = self.dir / "audio"
+        audio_dir.mkdir(exist_ok=True)
+        old = self.audio_path
+        path = audio_dir / audio.name
+        tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            shutil.copy2(audio, tmp)
+            tmp.replace(path)
+            if old is not None and old != path:
+                old.unlink(missing_ok=True)
+            self.update(audio=f"audio/{path.name}", audio_sha1=file_sha1(path))
+        finally:
+            tmp.unlink(missing_ok=True)
 
     # ------------------------------------------------------------ テイク
     @property
